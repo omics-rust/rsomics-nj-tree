@@ -38,6 +38,10 @@ pub fn nj_from_matrix(input: &Path, output: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
+// Canonical neighbor-joining (full Q-matrix scan). The distance matrix is a flat
+// row-major buffer sized for all 2n-1 nodes up front, so the O(N²) inner loops are
+// cache-friendly and joins append in place — same tree as the textbook algorithm,
+// no per-iteration allocation.
 #[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
 fn neighbor_joining(names: &[&str], dist: &[Vec<f64>]) -> String {
     let n = names.len();
@@ -45,31 +49,50 @@ fn neighbor_joining(names: &[&str], dist: &[Vec<f64>]) -> String {
         return names.first().map_or(String::new(), |s| format!("{s};"));
     }
 
-    let mut d: Vec<Vec<f64>> = dist.to_vec();
-    let mut labels: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
-    let mut active: Vec<bool> = vec![true; n];
+    let max = 2 * n;
+    let mut d = vec![0.0f64; max * max];
+    for (i, row) in dist.iter().enumerate() {
+        let base = i * max;
+        for (j, &v) in row.iter().enumerate() {
+            d[base + j] = v;
+        }
+    }
 
-    while labels.iter().filter(|_| true).count() > 0 {
-        let alive: Vec<usize> = (0..active.len()).filter(|&i| active[i]).collect();
+    let mut labels: Vec<String> = Vec::with_capacity(max);
+    labels.extend(names.iter().map(|s| (*s).to_string()));
+    let mut active = vec![false; max];
+    active[..n].fill(true);
+    let mut count = n;
+
+    let mut alive: Vec<usize> = Vec::with_capacity(max);
+    let mut r = vec![0.0f64; max];
+
+    loop {
+        alive.clear();
+        alive.extend((0..count).filter(|&i| active[i]));
         let m = alive.len();
         if m <= 2 {
             break;
         }
 
-        let mut r = vec![0.0f64; active.len()];
+        let inv = 1.0 / (m - 2) as f64;
         for &i in &alive {
+            let base = i * max;
+            let mut s = 0.0;
             for &j in &alive {
-                r[i] += d[i][j];
+                s += d[base + j];
             }
-            r[i] /= (m - 2) as f64;
+            r[i] = s * inv;
         }
 
         let mut min_val = f64::INFINITY;
-        let mut min_i = 0;
-        let mut min_j = 0;
+        let mut min_i = alive[0];
+        let mut min_j = alive[1];
         for (ai, &i) in alive.iter().enumerate() {
+            let base = i * max;
+            let ri = r[i];
             for &j in &alive[ai + 1..] {
-                let q = d[i][j] - r[i] - r[j];
+                let q = d[base + j] - ri - r[j];
                 if q < min_val {
                     min_val = q;
                     min_i = i;
@@ -78,54 +101,39 @@ fn neighbor_joining(names: &[&str], dist: &[Vec<f64>]) -> String {
             }
         }
 
-        let dist_ij = d[min_i][min_j];
+        let dist_ij = d[min_i * max + min_j];
         let branch_i = 0.5 * dist_ij + 0.5 * (r[min_i] - r[min_j]);
         let branch_j = dist_ij - branch_i;
-
-        let new_label = format!(
+        labels.push(format!(
             "({}:{branch_i:.6},{}:{branch_j:.6})",
             labels[min_i], labels[min_j]
-        );
+        ));
 
-        let new_idx = d.len();
-        let mut new_row = vec![0.0; new_idx + 1];
+        let nu = count;
+        let nb = nu * max;
         for &k in &alive {
             if k == min_i || k == min_j {
                 continue;
             }
-            let dk = 0.5 * (d[k][min_i] + d[k][min_j] - dist_ij);
-            new_row[k] = dk;
+            let dk = 0.5 * (d[k * max + min_i] + d[k * max + min_j] - dist_ij);
+            d[nb + k] = dk;
+            d[k * max + nu] = dk;
         }
-        for row in &mut d {
-            row.push(0.0);
-        }
-        d.push(new_row.clone());
-        for (k, &val) in new_row.iter().enumerate() {
-            if k < d.len() - 1 {
-                d[k][new_idx] = val;
-            }
-        }
-
-        labels.push(new_label);
-        active.push(true);
         active[min_i] = false;
         active[min_j] = false;
+        active[nu] = true;
+        count += 1;
     }
 
-    let alive: Vec<usize> = (0..active.len()).filter(|&i| active[i]).collect();
-    if alive.len() == 2 {
-        let i = alive[0];
-        let j = alive[1];
-        format!(
+    match alive.as_slice() {
+        [i, j] => format!(
             "({}:{:.6},{}:{:.6});",
-            labels[i],
-            d[i][j] / 2.0,
-            labels[j],
-            d[i][j] / 2.0
-        )
-    } else if alive.len() == 1 {
-        format!("{};", labels[alive[0]])
-    } else {
-        String::from("();")
+            labels[*i],
+            d[i * max + j] / 2.0,
+            labels[*j],
+            d[i * max + j] / 2.0
+        ),
+        [i] => format!("{};", labels[*i]),
+        _ => String::from("();"),
     }
 }
